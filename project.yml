@@ -1,0 +1,231 @@
+name: SlideSVC
+options:
+  bundleIdPrefix: com.forensic.slidesvc
+  deploymentTarget:
+    macOS: "13.0"
+  xcodeVersion: "15.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+  useBaseInternationalization: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "Apple Development"
+    DEVELOPMENT_TEAM: "25YCR7GV2X"
+    ENABLE_HARDENED_RUNTIME: NO
+    # OpenSlide include paths
+    HEADER_SEARCH_PATHS:
+      - /opt/homebrew/include
+      - /opt/homebrew/include/openslide
+    LIBRARY_SEARCH_PATHS:
+      - /opt/homebrew/lib
+    OTHER_LDFLAGS:
+      - -lopenslide
+
+packages:
+  SlideCore:
+    path: .
+
+targets:
+  SlideSVC:
+    type: application
+    platform: macOS
+    sources:
+      - path: SlideSVC
+        excludes:
+          - "*.entitlements"
+    info:
+      path: SlideSVC/Info.plist
+      properties:
+        LSUIElement: true
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: com.forensic.slidesvc.svs
+            UTTypeDescription: Aperio SVS Virtual Slide
+            UTTypeConformsTo:
+              - public.data
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - svs
+          - UTTypeIdentifier: com.forensic.slidesvc.ndpi
+            UTTypeDescription: Hamamatsu NDPI Virtual Slide
+            UTTypeConformsTo:
+              - public.data
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - ndpi
+          - UTTypeIdentifier: com.forensic.slidesvc.scn
+            UTTypeDescription: Leica SCN Virtual Slide
+            UTTypeConformsTo:
+              - public.data
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - scn
+          - UTTypeIdentifier: com.forensic.slidesvc.bif
+            UTTypeDescription: Ventana BIF Virtual Slide
+            UTTypeConformsTo:
+              - public.data
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - bif
+          - UTTypeIdentifier: com.forensic.slidesvc.mrxs
+            UTTypeDescription: 3DHISTECH MRXS Virtual Slide
+            UTTypeConformsTo:
+              - public.data
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - mrxs
+
+    entitlements:
+      path: SlideSVC/SlideSVC.entitlements
+    dependencies:
+      - target: SlideQLThumbnail
+        embed: true
+        codeSign: true
+        copyPhase:
+          destination: plugins
+      - target: SlideQLPreview
+        embed: true
+        codeSign: true
+        copyPhase:
+          destination: plugins
+      - target: SlideQLGenerator
+        embed: true
+        codeSign: true
+        copyPhase:
+          destination: plugins
+      - package: SlideCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.forensic.slidesvc
+        INFOPLIST_FILE: SlideSVC/Info.plist
+        LD_RUNPATH_SEARCH_PATHS:
+          - "@executable_path/../Frameworks"
+    postBuildScripts:
+      - name: Embed OpenSlide
+        script: "${PROJECT_DIR}/scripts/embed_openslide.sh"
+        basedOnDependencyAnalysis: false
+
+  SlideQLThumbnail:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: SlideQLThumbnail
+        excludes:
+          - Info.plist
+          - "*.entitlements"
+    info:
+      path: SlideQLThumbnail/Info.plist
+      properties:
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.quicklook.thumbnail
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ThumbnailProvider
+          NSExtensionAttributes:
+            QLSupportedContentTypes:
+              - com.forensic.slidesvc.svs
+              - com.forensic.slidesvc.ndpi
+              - com.forensic.slidesvc.scn
+              - com.forensic.slidesvc.bif
+              - com.forensic.slidesvc.mrxs
+            QLSupportsSearchableItems: true
+    dependencies:
+      - package: SlideCore
+    entitlements:
+      path: SlideQLThumbnail/SlideQLThumbnail.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.files.user-selected.read-only: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.forensic.slidesvc.thumbnail
+        SKIP_INSTALL: YES
+        LD_RUNPATH_SEARCH_PATHS:
+          - "@executable_path/../Frameworks"
+          - "@executable_path/../../../../Frameworks"
+
+  SlideQLPreview:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: SlideQLPreview
+        excludes:
+          - Info.plist
+          - "*.entitlements"
+    info:
+      path: SlideQLPreview/Info.plist
+      properties:
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.quicklook.preview
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PreviewViewController
+          NSExtensionAttributes:
+            QLSupportedContentTypes:
+              - com.forensic.slidesvc.svs
+              - com.forensic.slidesvc.ndpi
+              - com.forensic.slidesvc.scn
+              - com.forensic.slidesvc.bif
+              - com.forensic.slidesvc.mrxs
+            QLSupportsSearchableItems: true
+    dependencies:
+      - package: SlideCore
+    entitlements:
+      path: SlideQLPreview/SlideQLPreview.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.files.user-selected.read-only: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.forensic.slidesvc.preview
+        SKIP_INSTALL: YES
+        LD_RUNPATH_SEARCH_PATHS:
+          - "@executable_path/../Frameworks"
+          - "@executable_path/../../../../Frameworks"
+
+  SlideQLGenerator:
+    type: bundle
+    platform: macOS
+    sources:
+      - path: SlideQLGenerator
+        excludes:
+          - Info.plist
+    info:
+      path: SlideQLGenerator/Info.plist
+      properties:
+        CFPlugInDynamicRegisterFunction: ""
+        CFPlugInDynamicRegistration: "NO"
+        CFPlugInFactories:
+          A1B2C3D4-E5F6-7890-ABCD-EF1234567890: QuickLookGeneratorPluginFactory
+        CFPlugInTypes:
+          5E2D9680-5022-40FA-B806-43349622E5B9:
+            - A1B2C3D4-E5F6-7890-ABCD-EF1234567890
+        CFPlugInUnloadFunction: ""
+        CFBundleDocumentTypes:
+          - CFBundleTypeRole: QLGenerator
+            LSItemContentTypes:
+              - com.forensic.slidesvc.svs
+              - com.forensic.slidesvc.ndpi
+              - com.forensic.slidesvc.scn
+              - com.forensic.slidesvc.bif
+              - com.forensic.slidesvc.mrxs
+              - public.tiff
+        QLNeedsToBeRunInMainThread: false
+        QLPreviewHeight: 600
+        QLPreviewWidth: 800
+        QLSupportsConcurrentRequests: false
+        QLThumbnailMinimumSize: 17
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.forensic.slidesvc.qlgenerator
+        WRAPPER_EXTENSION: qlgenerator
+        SKIP_INSTALL: YES
+        HEADER_SEARCH_PATHS:
+          - /opt/homebrew/include
+          - /opt/homebrew/include/openslide
+        LIBRARY_SEARCH_PATHS:
+          - /opt/homebrew/lib
+        OTHER_LDFLAGS:
+          - -lopenslide
+        LD_RUNPATH_SEARCH_PATHS:
+          - "@loader_path/../Frameworks"
+          - /opt/homebrew/lib

@@ -1,0 +1,5 @@
+module COpenSlide {
+    header "include/openslide-shim.h"
+    link "openslide"
+    export *
+}
