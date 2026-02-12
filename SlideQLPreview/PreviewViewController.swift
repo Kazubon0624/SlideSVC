@@ -493,6 +493,13 @@ class SlideView: NSView {
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
     
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // Enable trackpad gesture events (pinch zoom)
+        allowedTouchTypes = [.indirect]  // trackpad touches
+        wantsRestingTouches = true
+    }
+    
     var minZoom: Double {
         guard slideWidth > 0, slideHeight > 0, bounds.width > 0, bounds.height > 0 else { return 0.005 }
         let sx = Double(bounds.width) / Double(slideWidth)
