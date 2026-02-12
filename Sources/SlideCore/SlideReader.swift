@@ -239,36 +239,18 @@ public final class SlideReader {
     
     /// Convert ARGB buffer to CGImage
     private func createCGImage(from buffer: [UInt32], width: Int, height: Int) -> CGImage? {
-        // OpenSlide returns pre-multiplied ARGB in native byte order
-        // We need to convert to a format CGImage understands
+        // OpenSlide returns pre-multiplied ARGB as uint32 in native byte order
+        // On little-endian (ARM): memory layout is BB GG RR AA
+        // CGBitmapInfo: premultipliedFirst + byteOrder32Little = BGRA in memory = ARGB logical
+        // This matches OpenSlide's output exactly — no conversion needed
         
         let bitsPerComponent = 8
         let bitsPerPixel = 32
         let bytesPerRow = width * 4
         
-        // Create a copy of the buffer that we can modify
-        var rgbaBuffer = buffer
-        
-        // Convert from ARGB to RGBA and un-premultiply
-        for i in 0..<rgbaBuffer.count {
-            let pixel = rgbaBuffer[i]
-            let a = (pixel >> 24) & 0xFF
-            var r = (pixel >> 16) & 0xFF
-            var g = (pixel >> 8) & 0xFF
-            var b = pixel & 0xFF
-            
-            // Un-premultiply if alpha is not 0 or 255
-            if a > 0 && a < 255 {
-                r = min(255, r * 255 / a)
-                g = min(255, g * 255 / a)
-                b = min(255, b * 255 / a)
-            }
-            
-            // Store as RGBA
-            rgbaBuffer[i] = (a << 24) | (b << 16) | (g << 8) | r
+        let data = buffer.withUnsafeBufferPointer { ptr in
+            Data(bytes: ptr.baseAddress!, count: ptr.count * 4)
         }
-        
-        let data = Data(bytes: &rgbaBuffer, count: rgbaBuffer.count * 4)
         
         guard let provider = CGDataProvider(data: data as CFData) else {
             return nil
