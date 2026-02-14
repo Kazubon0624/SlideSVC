@@ -3,6 +3,14 @@ import Quartz
 import QuickLookUI
 import UniformTypeIdentifiers
 import SlideCore
+import os
+
+// MARK: - Signpost Logger
+
+private let signpostLog = OSLog(subsystem: "com.forensic.slidesvc.preview", category: "Performance")
+private let signposter = OSSignposter(logHandle: signpostLog)
+/// Track files already previewed in this process lifetime for cold/warm classification
+private var seenFiles = Set<String>()
 
 // MARK: - PreviewViewController
 
@@ -13,6 +21,7 @@ class PreviewViewController: NSViewController, QLPreviewingController {
     private var infoBar: NSView!
     private var zoomLabel: NSTextField!
     private var currentFileName: String = "slide"
+    var ttfvState: OSSignpostIntervalState?
     
     override var nibName: NSNib.Name? { nil }
     
@@ -26,6 +35,13 @@ class PreviewViewController: NSViewController, QLPreviewingController {
     
     func preparePreviewOfFile(at url: URL, completionHandler handler: @escaping (Error?) -> Void) {
         NSLog("SlideQLPreview: preparePreviewOfFile called for %@", url.path)
+        
+        // --- TTFV signpost begin ---
+        let fileName = url.lastPathComponent
+        let mode = seenFiles.contains(fileName) ? "warm" : "cold"
+        seenFiles.insert(fileName)
+        let ttfvState = signposter.beginInterval("TTFV", id: signposter.makeSignpostID(), "file=\(fileName, privacy: .public) mode=\(mode, privacy: .public)")
+        self.ttfvState = ttfvState
         
         DispatchQueue.global(qos: .userInitiated).async {
             do {
@@ -53,6 +69,9 @@ class PreviewViewController: NSViewController, QLPreviewingController {
                 }
             } catch {
                 NSLog("SlideQLPreview: error: %@", error.localizedDescription)
+                // --- TTFV signpost end (error) ---
+                signposter.endInterval("TTFV", ttfvState, "error")
+                self.ttfvState = nil
                 self.showError("OpenSlide: \(error.localizedDescription)", handler: handler)
             }
         }
@@ -117,6 +136,7 @@ class PreviewViewController: NSViewController, QLPreviewingController {
         // === Slide view (main area) - add first so it's behind overlays ===
         slideView = SlideView()
         slideView.translatesAutoresizingMaskIntoConstraints = false
+        slideView.parentVC = self
         slideView.reader = reader
         slideView.slideWidth = slideWidth
         slideView.slideHeight = slideHeight
@@ -490,6 +510,11 @@ class SlideView: NSView {
     private var lastDragPoint: NSPoint = .zero
     private var reloadTimer: Timer?
     
+    /// Signpost state for NavLatency interval
+    private var navSignpostState: OSSignpostIntervalState?
+    /// Reference to parent VC for TTFV end signpost
+    weak var parentVC: PreviewViewController?
+    
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
     
@@ -540,6 +565,14 @@ class SlideView: NSView {
         needsDisplay = true
         onViewportChanged?()
         reloadTimer?.invalidate()
+        
+        // --- NavLatency signpost begin ---
+        // Cancel previous if still pending (debounce)
+        if let prev = navSignpostState {
+            signposter.endInterval("NavLatency", prev, "cancelled")
+        }
+        navSignpostState = signposter.beginInterval("NavLatency", id: signposter.makeSignpostID())
+        
         reloadTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: false) { [weak self] _ in
             self?.loadVisibleRegion()
         }
@@ -621,6 +654,18 @@ class SlideView: NSView {
                 }
                 self.isLoading = false
                 self.needsDisplay = true
+                
+                // --- TTFV signpost end (first view) ---
+                if let vc = self.parentVC, let ttfvState = vc.ttfvState {
+                    signposter.endInterval("TTFV", ttfvState, "rendered")
+                    vc.ttfvState = nil
+                }
+                
+                // --- NavLatency signpost end ---
+                if let navState = self.navSignpostState {
+                    signposter.endInterval("NavLatency", navState, "rendered")
+                    self.navSignpostState = nil
+                }
                 
                 if self.pendingReload {
                     self.pendingReload = false
