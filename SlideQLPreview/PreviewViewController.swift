@@ -12,6 +12,63 @@ private let signposter = OSSignposter(logHandle: signpostLog)
 /// Track files already previewed in this process lifetime for cold/warm classification
 private var seenFiles = Set<String>()
 
+// MARK: - PerfLogger (direct CSV output)
+
+/// Writes performance measurements directly to a CSV file
+/// Output: ~/Library/Containers/com.forensic.slidesvc.preview/Data/Documents/signposts_live.csv
+private final class PerfLogger {
+    static let shared = PerfLogger()
+    
+    let csvPath: String
+    private let queue = DispatchQueue(label: "com.forensic.slidesvc.perflogger")
+    private var fileHandle: FileHandle?
+    
+    private init() {
+        // Use sandbox Documents directory (always writable by the extension)
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let csvURL = docs.appendingPathComponent("signposts_live.csv")
+        csvPath = csvURL.path
+        
+        // Create file with header if it doesn't exist
+        if !FileManager.default.fileExists(atPath: csvPath) {
+            let header = "timestamp,interval,mode,file,duration_ms,status\n"
+            FileManager.default.createFile(atPath: csvPath, contents: header.data(using: .utf8))
+        }
+        
+        fileHandle = FileHandle(forWritingAtPath: csvPath)
+        fileHandle?.seekToEndOfFile()
+        NSLog("PerfLogger: writing to %@", csvPath)
+    }
+    
+    func log(interval: String, mode: String, file: String, durationMs: Double, status: String) {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            let ts = ISO8601DateFormatter().string(from: Date())
+            let safeFile = file.replacingOccurrences(of: ",", with: "_")
+            let line = "\(ts),\(interval),\(mode),\(safeFile),\(String(format: "%.2f", durationMs)),\(status)\n"
+            if let data = line.data(using: .utf8) {
+                self.fileHandle?.write(data)
+            }
+        }
+    }
+    
+    /// Reset CSV for a new measurement run
+    func reset() {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            self.fileHandle?.closeFile()
+            let header = "timestamp,interval,mode,file,duration_ms,status\n"
+            FileManager.default.createFile(atPath: self.csvPath, contents: header.data(using: .utf8))
+            self.fileHandle = FileHandle(forWritingAtPath: self.csvPath)
+            self.fileHandle?.seekToEndOfFile()
+        }
+    }
+    
+    deinit {
+        fileHandle?.closeFile()
+    }
+}
+
 // MARK: - PreviewViewController
 
 class PreviewViewController: NSViewController, QLPreviewingController {
@@ -22,6 +79,9 @@ class PreviewViewController: NSViewController, QLPreviewingController {
     private var zoomLabel: NSTextField!
     private var currentFileName: String = "slide"
     var ttfvState: OSSignpostIntervalState?
+    var ttfvStartTime: CFAbsoluteTime = 0
+    var ttfvMode: String = "cold"
+    var ttfvFileName: String = ""
     
     override var nibName: NSNib.Name? { nil }
     
@@ -42,6 +102,9 @@ class PreviewViewController: NSViewController, QLPreviewingController {
         seenFiles.insert(fileName)
         let ttfvState = signposter.beginInterval("TTFV", id: signposter.makeSignpostID(), "file=\(fileName, privacy: .public) mode=\(mode, privacy: .public)")
         self.ttfvState = ttfvState
+        self.ttfvStartTime = CFAbsoluteTimeGetCurrent()
+        self.ttfvMode = mode
+        self.ttfvFileName = fileName
         
         DispatchQueue.global(qos: .userInitiated).async {
             do {
@@ -512,6 +575,7 @@ class SlideView: NSView {
     
     /// Signpost state for NavLatency interval
     private var navSignpostState: OSSignpostIntervalState?
+    private var navStartTime: CFAbsoluteTime = 0
     /// Reference to parent VC for TTFV end signpost
     weak var parentVC: PreviewViewController?
     
@@ -572,6 +636,7 @@ class SlideView: NSView {
             signposter.endInterval("NavLatency", prev, "cancelled")
         }
         navSignpostState = signposter.beginInterval("NavLatency", id: signposter.makeSignpostID())
+        navStartTime = CFAbsoluteTimeGetCurrent()
         
         reloadTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: false) { [weak self] _ in
             self?.loadVisibleRegion()
@@ -658,12 +723,16 @@ class SlideView: NSView {
                 // --- TTFV signpost end (first view) ---
                 if let vc = self.parentVC, let ttfvState = vc.ttfvState {
                     signposter.endInterval("TTFV", ttfvState, "rendered")
+                    let elapsed = (CFAbsoluteTimeGetCurrent() - vc.ttfvStartTime) * 1000.0
+                    PerfLogger.shared.log(interval: "TTFV", mode: vc.ttfvMode, file: vc.ttfvFileName, durationMs: elapsed, status: "rendered")
                     vc.ttfvState = nil
                 }
                 
                 // --- NavLatency signpost end ---
                 if let navState = self.navSignpostState {
                     signposter.endInterval("NavLatency", navState, "rendered")
+                    let elapsed = (CFAbsoluteTimeGetCurrent() - self.navStartTime) * 1000.0
+                    PerfLogger.shared.log(interval: "NavLatency", mode: "", file: "", durationMs: elapsed, status: "rendered")
                     self.navSignpostState = nil
                 }
                 
