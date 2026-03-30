@@ -86,11 +86,14 @@ if [ -f "$APP_BIN" ]; then
     done
 fi
 
-# Fix appex binaries and inject entitlements
+# Fix appex binaries, debug dylibs, and inject entitlements
 for appex in "${BUILT_PRODUCTS_DIR}/${PLUGINS_FOLDER_PATH}"/*.appex; do
     if [ -d "$appex" ]; then
         appex_name=$(basename "$appex" .appex)
-        appex_bin="${appex}/Contents/MacOS/${appex_name}"
+        appex_macos="${appex}/Contents/MacOS"
+        
+        # Fix the main appex binary
+        appex_bin="${appex_macos}/${appex_name}"
         if [ -f "$appex_bin" ]; then
             deps=$(otool -L "$appex_bin" | tail -n +2 | awk '{print $1}')
             for dep in $deps; do
@@ -99,13 +102,29 @@ for appex in "${BUILT_PRODUCTS_DIR}/${PLUGINS_FOLDER_PATH}"/*.appex; do
                     /opt/homebrew/*) install_name_tool -change "$dep" "@rpath/${dep_name}" "$appex_bin" 2>/dev/null || true ;;
                 esac
             done
-            ENTFILE="${PROJECT_DIR}/${appex_name}/${appex_name}.entitlements"
-            if [ -f "$ENTFILE" ]; then
-                echo "Re-signing ${appex_name} with entitlements"
-                codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" --entitlements "$ENTFILE" "$appex" 2>/dev/null || true
-            else
-                codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" "$appex" 2>/dev/null || true
+        fi
+        
+        # Fix all dylibs inside the appex (including .debug.dylib)
+        for dylib in "${appex_macos}"/*.dylib; do
+            if [ -f "$dylib" ]; then
+                deps=$(otool -L "$dylib" | tail -n +2 | awk '{print $1}')
+                for dep in $deps; do
+                    dep_name=$(basename "$dep")
+                    case "$dep" in
+                        /opt/homebrew/*) install_name_tool -change "$dep" "@rpath/${dep_name}" "$dylib" 2>/dev/null || true ;;
+                    esac
+                done
+                # Re-sign the dylib after modification
+                codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" "$dylib" 2>/dev/null || true
             fi
+        done
+        
+        ENTFILE="${PROJECT_DIR}/${appex_name}/${appex_name}.entitlements"
+        if [ -f "$ENTFILE" ]; then
+            echo "Re-signing ${appex_name} with entitlements"
+            codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" --entitlements "$ENTFILE" "$appex" 2>/dev/null || true
+        else
+            codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" "$appex" 2>/dev/null || true
         fi
     fi
 done

@@ -12,60 +12,19 @@ private let signposter = OSSignposter(logHandle: signpostLog)
 /// Track files already previewed in this process lifetime for cold/warm classification
 private var seenFiles = Set<String>()
 
-// MARK: - PerfLogger (direct CSV output)
+// MARK: - PerfLogger (os_log-based, no file I/O)
 
-/// Writes performance measurements directly to a CSV file
-/// Output: ~/Library/Containers/com.forensic.slidesvc.preview/Data/Documents/signposts_live.csv
+/// Emits performance measurements via os_log at .error level (always visible)
+/// Capture: `log stream --predicate 'subsystem == "com.forensic.slidesvc.perf"'`
 private final class PerfLogger {
     static let shared = PerfLogger()
-    
-    let csvPath: String
-    private let queue = DispatchQueue(label: "com.forensic.slidesvc.perflogger")
-    private var fileHandle: FileHandle?
-    
-    private init() {
-        // Use sandbox Documents directory (always writable by the extension)
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let csvURL = docs.appendingPathComponent("signposts_live.csv")
-        csvPath = csvURL.path
-        
-        // Create file with header if it doesn't exist
-        if !FileManager.default.fileExists(atPath: csvPath) {
-            let header = "timestamp,interval,mode,file,duration_ms,status\n"
-            FileManager.default.createFile(atPath: csvPath, contents: header.data(using: .utf8))
-        }
-        
-        fileHandle = FileHandle(forWritingAtPath: csvPath)
-        fileHandle?.seekToEndOfFile()
-        NSLog("PerfLogger: writing to %@", csvPath)
-    }
+    private let perfLog = OSLog(subsystem: "com.forensic.slidesvc.perf", category: "measurement")
+    private init() {}
     
     func log(interval: String, mode: String, file: String, durationMs: Double, status: String) {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            let ts = ISO8601DateFormatter().string(from: Date())
-            let safeFile = file.replacingOccurrences(of: ",", with: "_")
-            let line = "\(ts),\(interval),\(mode),\(safeFile),\(String(format: "%.2f", durationMs)),\(status)\n"
-            if let data = line.data(using: .utf8) {
-                self.fileHandle?.write(data)
-            }
-        }
-    }
-    
-    /// Reset CSV for a new measurement run
-    func reset() {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            self.fileHandle?.closeFile()
-            let header = "timestamp,interval,mode,file,duration_ms,status\n"
-            FileManager.default.createFile(atPath: self.csvPath, contents: header.data(using: .utf8))
-            self.fileHandle = FileHandle(forWritingAtPath: self.csvPath)
-            self.fileHandle?.seekToEndOfFile()
-        }
-    }
-    
-    deinit {
-        fileHandle?.closeFile()
+        os_log(.error, log: perfLog,
+               "[PERF] interval=%{public}@,mode=%{public}@,file=%{public}@,duration_ms=%{public}.2f,status=%{public}@",
+               interval, mode, file, durationMs, status)
     }
 }
 
@@ -131,11 +90,24 @@ class PreviewViewController: NSViewController, QLPreviewingController {
                     handler(nil)
                 }
             } catch {
-                NSLog("SlideQLPreview: error: %@", error.localizedDescription)
+                NSLog("SlideQLPreview: OpenSlide error: %@", error.localizedDescription)
                 // --- TTFV signpost end (error) ---
                 signposter.endInterval("TTFV", ttfvState, "error")
                 self.ttfvState = nil
-                self.showError("OpenSlide: \(error.localizedDescription)", handler: handler)
+                
+                // Fallback: try ImageIO to show a static overview for large NDPI/TIFF files
+                if let fallbackImage = self.loadFallbackImage(url: url) {
+                    DispatchQueue.main.async {
+                        self.showFallbackPreview(
+                            image: fallbackImage,
+                            fileName: url.lastPathComponent,
+                            errorDetail: error.localizedDescription
+                        )
+                        handler(nil)
+                    }
+                } else {
+                    self.showError("このファイルを開けません\n\n\(error.localizedDescription)\n\nNDPIファイルが4GBを超える場合、OpenSlide 4.0の制限により表示できないことがあります。", handler: handler)
+                }
             }
         }
     }
@@ -186,6 +158,73 @@ class PreviewViewController: NSViewController, QLPreviewingController {
             ])
             handler(nil)
         }
+    }
+    
+    // MARK: - NDPI Fallback (for large NDPI files OpenSlide cannot open)
+    
+    /// Try to read an overview image using the minimal TIFF IFD parser (no ImageIO — avoids hanging)
+    private func loadFallbackImage(url: URL) -> CGImage? {
+        return NDPIFallbackReader.loadOverview(url: url)
+    }
+    
+    /// Show a static image preview with info banner when OpenSlide fails
+    private func showFallbackPreview(image: CGImage, fileName: String, errorDetail: String) {
+        let imgW = CGFloat(image.width)
+        let imgH = CGFloat(image.height)
+        
+        // Image view
+        let nsImage = NSImage(cgImage: image, size: NSSize(width: imgW, height: imgH))
+        let imageView = NSImageView(image: nsImage)
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(imageView)
+        
+        // Info banner at bottom
+        let banner = NSView()
+        banner.wantsLayer = true
+        banner.layer?.backgroundColor = NSColor(white: 0.1, alpha: 0.85).cgColor
+        banner.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(banner)
+        
+        let nameLabel = NSTextField(labelWithString: (fileName as NSString).deletingPathExtension)
+        nameLabel.font = NSFont.boldSystemFont(ofSize: 14)
+        nameLabel.textColor = .white
+        nameLabel.translatesAutoresizingMaskIntoConstraints = false
+        banner.addSubview(nameLabel)
+        
+        let noteLabel = NSTextField(labelWithString: "⚠️ OpenSlide 4.0 の制限によりインタラクティブ表示不可（NDPI > 4GB）\n静止画プレビューを表示中")
+        noteLabel.font = NSFont.systemFont(ofSize: 11)
+        noteLabel.textColor = NSColor(white: 0.6, alpha: 1)
+        noteLabel.maximumNumberOfLines = 0
+        noteLabel.translatesAutoresizingMaskIntoConstraints = false
+        banner.addSubview(noteLabel)
+        
+        let sizeLabel = NSTextField(labelWithString: "\(Int(imgW))×\(Int(imgH))")
+        sizeLabel.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        sizeLabel.textColor = NSColor(white: 0.5, alpha: 1)
+        sizeLabel.translatesAutoresizingMaskIntoConstraints = false
+        banner.addSubview(sizeLabel)
+        
+        NSLayoutConstraint.activate([
+            imageView.topAnchor.constraint(equalTo: view.topAnchor),
+            imageView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            imageView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            imageView.bottomAnchor.constraint(equalTo: banner.topAnchor),
+            
+            banner.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            banner.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            banner.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            banner.heightAnchor.constraint(equalToConstant: 56),
+            
+            nameLabel.leadingAnchor.constraint(equalTo: banner.leadingAnchor, constant: 12),
+            nameLabel.topAnchor.constraint(equalTo: banner.topAnchor, constant: 8),
+            
+            noteLabel.leadingAnchor.constraint(equalTo: banner.leadingAnchor, constant: 12),
+            noteLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 2),
+            
+            sizeLabel.trailingAnchor.constraint(equalTo: banner.trailingAnchor, constant: -12),
+            sizeLabel.centerYAnchor.constraint(equalTo: banner.centerYAnchor),
+        ])
     }
     
     // MARK: - Build UI
