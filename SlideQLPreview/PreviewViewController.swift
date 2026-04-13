@@ -91,18 +91,13 @@ class PreviewViewController: NSViewController, QLPreviewingController {
                 }
             } catch {
                 NSLog("SlideQLPreview: OpenSlide error: %@", error.localizedDescription)
-                // --- TTFV signpost end (error) ---
                 signposter.endInterval("TTFV", ttfvState, "error")
                 self.ttfvState = nil
                 
-                // Fallback: try ImageIO to show a static overview for large NDPI/TIFF files
-                if let fallbackImage = self.loadFallbackImage(url: url) {
+                // Fallback: direct NDPI TIFF parser with 4GB overflow correction
+                if let result = NDPIFallbackReader.loadBestImage(url: url) {
                     DispatchQueue.main.async {
-                        self.showFallbackPreview(
-                            image: fallbackImage,
-                            fileName: url.lastPathComponent,
-                            errorDetail: error.localizedDescription
-                        )
+                        self.showFallbackPreview(result: result, fileName: url.lastPathComponent)
                         handler(nil)
                     }
                 } else {
@@ -160,71 +155,89 @@ class PreviewViewController: NSViewController, QLPreviewingController {
         }
     }
     
-    // MARK: - NDPI Fallback (for large NDPI files OpenSlide cannot open)
+    // MARK: - NDPI Fallback (zoomable preview for large NDPI files)
     
-    /// Try to read an overview image using the minimal TIFF IFD parser (no ImageIO — avoids hanging)
-    private func loadFallbackImage(url: URL) -> CGImage? {
-        return NDPIFallbackReader.loadOverview(url: url)
-    }
-    
-    /// Show a static image preview with info banner when OpenSlide fails
-    private func showFallbackPreview(image: CGImage, fileName: String, errorDetail: String) {
-        let imgW = CGFloat(image.width)
-        let imgH = CGFloat(image.height)
+    /// Show a zoomable/pannable preview for NDPI files OpenSlide cannot open
+    private func showFallbackPreview(result: NDPIFallbackReader.FallbackResult, fileName: String) {
+        let imgW = CGFloat(result.width)
+        let imgH = CGFloat(result.height)
+        let nsImage = NSImage(cgImage: result.image, size: NSSize(width: imgW, height: imgH))
         
-        // Image view
-        let nsImage = NSImage(cgImage: image, size: NSSize(width: imgW, height: imgH))
-        let imageView = NSImageView(image: nsImage)
-        imageView.imageScaling = .scaleProportionallyUpOrDown
-        imageView.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(imageView)
+        // Scrollable, zoomable image view
+        let imageView = NSImageView()
+        imageView.image = nsImage
+        imageView.imageScaling = .scaleNone
+        imageView.setFrameSize(NSSize(width: imgW, height: imgH))
         
-        // Info banner at bottom
-        let banner = NSView()
-        banner.wantsLayer = true
-        banner.layer?.backgroundColor = NSColor(white: 0.1, alpha: 0.85).cgColor
-        banner.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(banner)
+        let scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.hasHorizontalScroller = true
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.allowsMagnification = true
+        scrollView.minMagnification = 0.1
+        scrollView.maxMagnification = 10.0
+        scrollView.backgroundColor = NSColor(white: 0.11, alpha: 1)
+        scrollView.drawsBackground = true
+        scrollView.documentView = imageView
+        scrollView.magnification = 1.0
+        view.addSubview(scrollView)
         
-        let nameLabel = NSTextField(labelWithString: (fileName as NSString).deletingPathExtension)
-        nameLabel.font = NSFont.boldSystemFont(ofSize: 14)
+        // Info bar at top
+        let infoBar = NSView()
+        infoBar.wantsLayer = true
+        infoBar.layer?.backgroundColor = NSColor(white: 0.14, alpha: 0.95).cgColor
+        infoBar.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(infoBar)
+        
+        let baseName = (fileName as NSString).deletingPathExtension
+        let nameLabel = NSTextField(labelWithString: baseName)
+        nameLabel.font = NSFont.boldSystemFont(ofSize: 13)
         nameLabel.textColor = .white
         nameLabel.translatesAutoresizingMaskIntoConstraints = false
-        banner.addSubview(nameLabel)
+        infoBar.addSubview(nameLabel)
         
-        let noteLabel = NSTextField(labelWithString: "⚠️ OpenSlide 4.0 の制限によりインタラクティブ表示不可（NDPI > 4GB）\n静止画プレビューを表示中")
-        noteLabel.font = NSFont.systemFont(ofSize: 11)
-        noteLabel.textColor = NSColor(white: 0.6, alpha: 1)
-        noteLabel.maximumNumberOfLines = 0
-        noteLabel.translatesAutoresizingMaskIntoConstraints = false
-        banner.addSubview(noteLabel)
-        
-        let sizeLabel = NSTextField(labelWithString: "\(Int(imgW))×\(Int(imgH))")
+        let sizeText = "\(result.width)×\(result.height)  •  Level \(result.levelIndex)/\(result.totalLevels)"
+        let sizeLabel = NSTextField(labelWithString: sizeText)
         sizeLabel.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        sizeLabel.textColor = NSColor(white: 0.5, alpha: 1)
+        sizeLabel.textColor = NSColor(white: 0.55, alpha: 1)
         sizeLabel.translatesAutoresizingMaskIntoConstraints = false
-        banner.addSubview(sizeLabel)
+        infoBar.addSubview(sizeLabel)
+        
+        let noteLabel = NSTextField(labelWithString: "NDPI > 4GB — フォールバック表示  |  ⌘スクロール: ズーム  ドラッグ: パン")
+        noteLabel.font = NSFont.systemFont(ofSize: 10)
+        noteLabel.textColor = NSColor(white: 0.45, alpha: 1)
+        noteLabel.translatesAutoresizingMaskIntoConstraints = false
+        infoBar.addSubview(noteLabel)
         
         NSLayoutConstraint.activate([
-            imageView.topAnchor.constraint(equalTo: view.topAnchor),
-            imageView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            imageView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            imageView.bottomAnchor.constraint(equalTo: banner.topAnchor),
+            infoBar.topAnchor.constraint(equalTo: view.topAnchor),
+            infoBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            infoBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            infoBar.heightAnchor.constraint(equalToConstant: 44),
             
-            banner.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            banner.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            banner.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            banner.heightAnchor.constraint(equalToConstant: 56),
+            nameLabel.leadingAnchor.constraint(equalTo: infoBar.leadingAnchor, constant: 12),
+            nameLabel.topAnchor.constraint(equalTo: infoBar.topAnchor, constant: 6),
             
-            nameLabel.leadingAnchor.constraint(equalTo: banner.leadingAnchor, constant: 12),
-            nameLabel.topAnchor.constraint(equalTo: banner.topAnchor, constant: 8),
+            sizeLabel.leadingAnchor.constraint(equalTo: nameLabel.trailingAnchor, constant: 12),
+            sizeLabel.centerYAnchor.constraint(equalTo: nameLabel.centerYAnchor),
             
-            noteLabel.leadingAnchor.constraint(equalTo: banner.leadingAnchor, constant: 12),
-            noteLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 2),
+            noteLabel.leadingAnchor.constraint(equalTo: infoBar.leadingAnchor, constant: 12),
+            noteLabel.bottomAnchor.constraint(equalTo: infoBar.bottomAnchor, constant: -5),
             
-            sizeLabel.trailingAnchor.constraint(equalTo: banner.trailingAnchor, constant: -12),
-            sizeLabel.centerYAnchor.constraint(equalTo: banner.centerYAnchor),
+            scrollView.topAnchor.constraint(equalTo: infoBar.bottomAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
         ])
+        
+        // Fit image to view after layout
+        DispatchQueue.main.async {
+            let viewSize = scrollView.contentSize
+            let scaleX = viewSize.width / imgW
+            let scaleY = viewSize.height / imgH
+            scrollView.magnification = min(scaleX, scaleY, 1.0)
+        }
     }
     
     // MARK: - Build UI

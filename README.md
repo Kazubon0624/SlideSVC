@@ -10,6 +10,7 @@ Finderでバーチャルスライドファイルを選択してスペースキ�
 - 🗺️ **Minimap** — 全体像と現在の表示位置を常に表示
 - 📷 **Clipboard Copy** — 表示中の領域をミニマップ＋ズーム率付きでクリップボードにコピー
 - 🖼️ **Thumbnail** — Finderでサムネイル表示
+- 📎 **Large NDPI Support** — 4GB超のNDPIファイルも独自TIFFパーサーによるフォールバック表示（ズーム/パン可能）
 
 ## Supported Formats
 

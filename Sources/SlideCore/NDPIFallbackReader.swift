@@ -1,207 +1,264 @@
 import Foundation
 import CoreGraphics
 
-/// Minimal TIFF IFD parser for large NDPI files that OpenSlide and ImageIO cannot handle.
-/// Reads only the binary TIFF headers to find small sub-images (macro/label/map),
-/// then decodes JPEG strips directly — without loading the entire file.
+/// Minimal TIFF IFD parser for large NDPI files that OpenSlide 4.0 cannot handle (>4GB).
+/// Uses POSIX I/O (open/read/lseek) for fast, non-blocking access.
+///
+/// Key insight: NDPI files >4GB have 32-bit IFD/strip offsets that overflow.
+/// The real position is `stored_offset + N * 4GB`. We probe each candidate
+/// and validate with JPEG SOI markers (FF D8).
 public final class NDPIFallbackReader {
     
-    private struct IFDEntry {
-        let index: Int
-        let width: UInt32
-        let height: UInt32
-        let compression: UInt16
-        let stripOffset: UInt64
-        let stripByteCount: UInt64
+    private static let fourGB: UInt64 = 4_294_967_296
+    
+    /// Result of loading an overview image
+    public struct FallbackResult {
+        public let image: CGImage
+        public let width: Int
+        public let height: Int
+        public let levelIndex: Int   // which pyramid level this came from
+        public let totalLevels: Int  // total levels found
     }
     
-    /// Try to extract a small overview image from a large NDPI file.
-    /// Returns nil if the file cannot be parsed or no suitable sub-image is found.
-    public static func loadOverview(url: URL, maxPixels: Int = 4_000_000) -> CGImage? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
+    /// Try to extract the best available overview image from a large NDPI file.
+    /// Prefers the highest resolution image that's still loadable (<50MB JPEG).
+    public static func loadBestImage(url: URL) -> FallbackResult? {
+        let fd = open(url.path, O_RDONLY)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
         
-        // Read TIFF header (8 bytes)
-        guard let headerData = try? handle.read(upToCount: 8), headerData.count == 8 else { return nil }
+        let fileSize = UInt64(lseek(fd, 0, SEEK_END))
+        lseek(fd, 0, SEEK_SET)
+        guard fileSize > 8 else { return nil }
         
-        let isLittle: Bool
-        let magic = headerData[0...1]
-        if magic.elementsEqual([0x49, 0x49]) {       // "II" - little endian
-            isLittle = true
-        } else if magic.elementsEqual([0x4D, 0x4D]) { // "MM" - big endian
-            isLittle = false
-        } else {
-            return nil
+        // Read TIFF header
+        var hdr = [UInt8](repeating: 0, count: 8)
+        guard read(fd, &hdr, 8) == 8 else { return nil }
+        
+        let isLE = hdr[0] == 0x49 && hdr[1] == 0x49
+        guard r16(hdr, 2, isLE) == 42 else { return nil }
+        
+        let rawIFDOffset = UInt64(r32(hdr, 4, isLE))
+        
+        // Strategy 1: IFD chain with 4GB overflow correction
+        if let result = tryIFDChain(fd: fd, fileSize: fileSize, rawOffset: rawIFDOffset, isLE: isLE) {
+            return result
         }
         
-        let tiffMagic = readU16(headerData, offset: 2, littleEndian: isLittle)
-        guard tiffMagic == 42 else { return nil } // Classic TIFF
+        // Strategy 2: Scan end of file for JPEG
+        if let img = scanForJPEG(fd: fd, fileSize: fileSize) {
+            return FallbackResult(image: img, width: img.width, height: img.height,
+                                  levelIndex: 0, totalLevels: 1)
+        }
         
-        var ifdOffset = UInt64(readU32(headerData, offset: 4, littleEndian: isLittle))
+        return nil
+    }
+    
+    /// Backward-compatible convenience method
+    public static func loadOverview(url: URL, maxPixels: Int = 4_000_000) -> CGImage? {
+        return loadBestImage(url: url)?.image
+    }
+    
+    // MARK: - Strategy 1: IFD chain with 4GB overflow correction
+    
+    private struct IFDEntry {
+        let dir: Int; let w: UInt32; let h: UInt32
+        let comp: UInt16; let rawStripOff: UInt64; let stripBytes: UInt64; let stripCount: UInt32
+    }
+    
+    private static func tryIFDChain(fd: Int32, fileSize: UInt64, rawOffset: UInt64, isLE: Bool) -> FallbackResult? {
+        let maxMult = Int((fileSize / fourGB) + 1)
         
-        var entries: [IFDEntry] = []
-        let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? UInt64) ?? 0
-        
-        // Walk IFD chain (up to 30 directories to be safe)
-        for dirIndex in 0..<30 {
-            guard ifdOffset > 0 && ifdOffset < fileSize && ifdOffset < UInt64(Int64.max) else { break }
+        // Find a valid IFD start (try raw, +4GB, +8GB)
+        for mult in 0...min(maxMult, 3) {
+            let ifdStart = rawOffset + UInt64(mult) * fourGB
+            guard ifdStart < fileSize else { continue }
+            guard isValidIFD(fd: fd, offset: ifdStart, isLE: isLE) else { continue }
             
-            // Seek to IFD
-            try? handle.seek(toOffset: ifdOffset)
-            guard let countData = try? handle.read(upToCount: 2), countData.count == 2 else { break }
-            let tagCount = readU16(countData, offset: 0, littleEndian: isLittle)
-            guard tagCount > 0 && tagCount < 1000 else { break }
+            // Walk the full IFD chain
+            var entries = [IFDEntry]()
+            var ifdOffset = ifdStart
             
-            // Read all IFD entries (12 bytes each)
-            let ifdSize = Int(tagCount) * 12
-            guard let ifdData = try? handle.read(upToCount: ifdSize), ifdData.count == ifdSize else { break }
-            
-            var width: UInt32 = 0
-            var height: UInt32 = 0
-            var compression: UInt16 = 0
-            var stripOffset: UInt64 = 0
-            var stripByteCount: UInt64 = 0
-            
-            for t in 0..<Int(tagCount) {
-                let base = t * 12
-                let tag = readU16(ifdData, offset: base, littleEndian: isLittle)
-                let type = readU16(ifdData, offset: base + 2, littleEndian: isLittle)
-                let count = readU32(ifdData, offset: base + 4, littleEndian: isLittle)
+            for dirIdx in 0..<30 {
+                guard ifdOffset > 0, ifdOffset < fileSize else { break }
                 
-                switch tag {
-                case 256: // ImageWidth
-                    width = (type == 3) ? UInt32(readU16(ifdData, offset: base + 8, littleEndian: isLittle))
-                                        : readU32(ifdData, offset: base + 8, littleEndian: isLittle)
-                case 257: // ImageLength
-                    height = (type == 3) ? UInt32(readU16(ifdData, offset: base + 8, littleEndian: isLittle))
-                                         : readU32(ifdData, offset: base + 8, littleEndian: isLittle)
-                case 259: // Compression
-                    compression = readU16(ifdData, offset: base + 8, littleEndian: isLittle)
-                case 273: // StripOffsets (single strip)
-                    if count == 1 {
-                        stripOffset = (type == 3) ? UInt64(readU16(ifdData, offset: base + 8, littleEndian: isLittle))
-                                                  : UInt64(readU32(ifdData, offset: base + 8, littleEndian: isLittle))
+                lseek(fd, off_t(ifdOffset), SEEK_SET)
+                var cb = [UInt8](repeating: 0, count: 2)
+                guard read(fd, &cb, 2) == 2 else { break }
+                let tagCount = Int(r16(cb, 0, isLE))
+                guard tagCount > 0, tagCount < 500 else { break }
+                
+                let ifdBytes = tagCount * 12
+                var ifd = [UInt8](repeating: 0, count: ifdBytes)
+                guard read(fd, &ifd, ifdBytes) == ifdBytes else { break }
+                
+                var w: UInt32 = 0, h: UInt32 = 0, comp: UInt16 = 0
+                var sOff: UInt64 = 0, sBytes: UInt64 = 0, sCount: UInt32 = 0
+                
+                for t in 0..<tagCount {
+                    let b = t * 12
+                    let tag = r16(ifd, b, isLE)
+                    let typ = r16(ifd, b + 2, isLE)
+                    let cnt = r32(ifd, b + 4, isLE)
+                    switch tag {
+                    case 256: w = (typ == 3) ? UInt32(r16(ifd, b+8, isLE)) : r32(ifd, b+8, isLE)
+                    case 257: h = (typ == 3) ? UInt32(r16(ifd, b+8, isLE)) : r32(ifd, b+8, isLE)
+                    case 259: comp = r16(ifd, b+8, isLE)
+                    case 273:
+                        sCount = cnt
+                        if cnt == 1 { sOff = UInt64(r32(ifd, b+8, isLE)) }
+                    case 279:
+                        if cnt == 1 { sBytes = UInt64(r32(ifd, b+8, isLE)) }
+                    default: break
                     }
-                case 279: // StripByteCounts (single strip)
-                    if count == 1 {
-                        stripByteCount = (type == 3) ? UInt64(readU16(ifdData, offset: base + 8, littleEndian: isLittle))
-                                                     : UInt64(readU32(ifdData, offset: base + 8, littleEndian: isLittle))
-                    }
-                default:
+                }
+                
+                if w > 0 && h > 0 && sCount == 1 && sOff > 0 && sBytes > 0 {
+                    entries.append(IFDEntry(dir: dirIdx, w: w, h: h, comp: comp,
+                                            rawStripOff: sOff, stripBytes: sBytes, stripCount: sCount))
+                }
+                
+                // Next IFD pointer
+                var nb = [UInt8](repeating: 0, count: 4)
+                guard read(fd, &nb, 4) == 4 else { break }
+                let rawNext = UInt64(r32(nb, 0, isLE))
+                if rawNext == 0 { break }
+                
+                // Find valid next IFD (try raw, then +4GB corrections)
+                if let nextValid = findValidOffset(fd: fd, raw: rawNext, fileSize: fileSize,
+                                                    maxMult: maxMult, isLE: isLE, checkIFD: true) {
+                    ifdOffset = nextValid
+                } else {
                     break
                 }
             }
             
-            if width > 0 && height > 0 {
-                entries.append(IFDEntry(
-                    index: dirIndex,
-                    width: width, height: height,
-                    compression: compression,
-                    stripOffset: stripOffset,
-                    stripByteCount: stripByteCount
-                ))
-            }
+            guard !entries.isEmpty else { continue }
             
-            // Read next IFD offset (4 bytes after the IFD entries)
-            guard let nextData = try? handle.read(upToCount: 4), nextData.count == 4 else { break }
-            let nextOffset = UInt64(readU32(nextData, offset: 0, littleEndian: isLittle))
+            // Sort by pixel count descending — try best (largest) first
+            let sorted = entries.sorted { UInt64($0.w) * UInt64($0.h) > UInt64($1.w) * UInt64($1.h) }
             
-            // Safety: if next offset is 0 or beyond file size, stop
-            if nextOffset == 0 || nextOffset >= fileSize { break }
-            ifdOffset = nextOffset
-        }
-        
-        guard !entries.isEmpty else { return nil }
-        
-        NSLog("NDPIFallback: Found %d IFDs", entries.count)
-        for e in entries {
-            NSLog("NDPIFallback:   [%d] %dx%d comp=%d stripOff=%llu stripBytes=%llu",
-                  e.index, e.width, e.height, e.compression, e.stripOffset, e.stripByteCount)
-        }
-        
-        // Find the best overview: small enough (< maxPixels), but >= 128px in at least one dimension
-        // Prefer the smallest suitable image
-        let candidates = entries.filter { e in
-            let px = Int(e.width) * Int(e.height)
-            return px < maxPixels && px > 0 && (e.width >= 128 || e.height >= 128)
-                && e.stripOffset > 0 && e.stripByteCount > 0
-                && e.stripOffset < fileSize
-                && (e.stripOffset + e.stripByteCount) <= fileSize
-        }.sorted { Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height) }
-        
-        guard let best = candidates.first else {
-            NSLog("NDPIFallback: No suitable sub-image found")
-            return nil
-        }
-        
-        NSLog("NDPIFallback: Using IFD[%d] %dx%d (compression=%d, offset=%llu, bytes=%llu)",
-              best.index, best.width, best.height, best.compression, best.stripOffset, best.stripByteCount)
-        
-        // Read the strip data
-        try? handle.seek(toOffset: best.stripOffset)
-        guard let stripData = try? handle.read(upToCount: Int(best.stripByteCount)),
-              stripData.count > 0 else {
-            NSLog("NDPIFallback: Failed to read strip data")
-            return nil
-        }
-        
-        // JPEG compressed (compression == 7 for new-style JPEG, 6 for old-style)
-        if best.compression == 7 || best.compression == 6 || best.compression == 33003 /* NDPI JPEG */ {
-            // NDPI stores raw JPEG in strips — decode directly
-            if let provider = CGDataProvider(data: stripData as CFData),
-               let img = CGImage(jpegDataProviderSource: provider,
-                                 decode: nil, shouldInterpolate: true,
-                                 intent: .defaultIntent) {
-                NSLog("NDPIFallback: JPEG decode OK: %dx%d", img.width, img.height)
-                return img
-            }
-            NSLog("NDPIFallback: JPEG decode failed")
-        }
-        
-        // Uncompressed RGB (compression == 1)
-        if best.compression == 1 {
-            let w = Int(best.width)
-            let h = Int(best.height)
-            let bpr = w * 3 // Assuming RGB
-            if stripData.count >= bpr * h {
-                if let provider = CGDataProvider(data: stripData as CFData) {
-                    let cs = CGColorSpaceCreateDeviceRGB()
-                    return CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 24,
-                                   bytesPerRow: bpr, space: cs,
-                                   bitmapInfo: CGBitmapInfo(rawValue: 0),
-                                   provider: provider, decode: nil,
-                                   shouldInterpolate: true, intent: .defaultIntent)
+            // Try each entry, from largest to smallest, that's < 50MB JPEG
+            for entry in sorted {
+                guard entry.stripBytes < 80_000_000 else { continue } // Skip huge JPEGs
+                guard entry.stripBytes > 1000 else { continue }       // Skip tiny
+                
+                // Find actual strip offset (try raw, then +4GB corrections, validate with JPEG SOI)
+                let correctedOff = findValidOffset(fd: fd, raw: entry.rawStripOff,
+                                                    fileSize: fileSize, maxMult: maxMult,
+                                                    isLE: isLE, checkIFD: false)
+                    ?? entry.rawStripOff
+                
+                guard correctedOff < fileSize, (correctedOff + entry.stripBytes) <= fileSize else { continue }
+                
+                if let img = readAndDecodeJPEG(fd: fd, offset: correctedOff, bytes: entry.stripBytes) {
+                    return FallbackResult(image: img, width: img.width, height: img.height,
+                                          levelIndex: entry.dir, totalLevels: entries.count)
                 }
             }
         }
-        
-        NSLog("NDPIFallback: Unsupported compression %d", best.compression)
         return nil
+    }
+    
+    // MARK: - Offset correction helpers
+    
+    /// Check if an offset contains a valid IFD (tag count 1-499)
+    private static func isValidIFD(fd: Int32, offset: UInt64, isLE: Bool) -> Bool {
+        lseek(fd, off_t(offset), SEEK_SET)
+        var cb = [UInt8](repeating: 0, count: 2)
+        guard read(fd, &cb, 2) == 2 else { return false }
+        let tc = Int(r16(cb, 0, isLE))
+        return tc > 0 && tc < 500
+    }
+    
+    /// Find the correct 64-bit offset by trying raw, +4GB, +8GB, etc.
+    /// If checkIFD, validates with IFD tag count; otherwise validates with JPEG SOI.
+    private static func findValidOffset(fd: Int32, raw: UInt64, fileSize: UInt64,
+                                         maxMult: Int, isLE: Bool, checkIFD: Bool) -> UInt64? {
+        for m in 0...min(maxMult, 3) {
+            let candidate = raw + UInt64(m) * fourGB
+            guard candidate < fileSize else { continue }
+            
+            if checkIFD {
+                if isValidIFD(fd: fd, offset: candidate, isLE: isLE) { return candidate }
+            } else {
+                // Validate with JPEG SOI marker (FF D8)
+                lseek(fd, off_t(candidate), SEEK_SET)
+                var marker = [UInt8](repeating: 0, count: 2)
+                guard read(fd, &marker, 2) == 2 else { continue }
+                if marker[0] == 0xFF && marker[1] == 0xD8 { return candidate }
+            }
+        }
+        return nil
+    }
+    
+    // MARK: - JPEG decode
+    
+    private static func readAndDecodeJPEG(fd: Int32, offset: UInt64, bytes: UInt64) -> CGImage? {
+        lseek(fd, off_t(offset), SEEK_SET)
+        var buf = [UInt8](repeating: 0, count: Int(bytes))
+        let n = read(fd, &buf, Int(bytes))
+        guard n > 0 else { return nil }
+        
+        let data = Data(bytes: buf, count: n)
+        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
+        return CGImage(jpegDataProviderSource: provider, decode: nil,
+                       shouldInterpolate: true, intent: .defaultIntent)
+    }
+    
+    // MARK: - Strategy 2: Scan end of file for JPEG
+    
+    private static func scanForJPEG(fd: Int32, fileSize: UInt64, scanSize: Int = 10_000_000) -> CGImage? {
+        let scanStart = fileSize > UInt64(scanSize) ? fileSize - UInt64(scanSize) : 0
+        lseek(fd, off_t(scanStart), SEEK_SET)
+        
+        let readSize = Int(fileSize - scanStart)
+        var buf = [UInt8](repeating: 0, count: readSize)
+        let bytesRead = read(fd, &buf, readSize)
+        guard bytesRead > 4 else { return nil }
+        
+        // Find JPEG SOI/EOI pairs
+        struct Region { let start: Int; let end: Int }
+        var regions = [Region]()
+        var i = 0
+        while i < bytesRead - 3 {
+            if buf[i] == 0xFF && buf[i+1] == 0xD8 && buf[i+2] == 0xFF {
+                var j = i + 3
+                while j < bytesRead - 1 {
+                    if buf[j] == 0xFF && buf[j+1] == 0xD9 {
+                        regions.append(Region(start: i, end: j + 2))
+                        i = j + 2; break
+                    }
+                    j += 1
+                }
+                if j >= bytesRead - 1 { break }
+            } else { i += 1 }
+        }
+        
+        // Decode largest JPEG found
+        var bestImage: CGImage? = nil
+        var bestPx = 0
+        for region in regions {
+            let size = region.end - region.start
+            guard size > 1000 else { continue }
+            let data = Data(bytes: &buf + region.start, count: size)
+            if let provider = CGDataProvider(data: data as CFData),
+               let img = CGImage(jpegDataProviderSource: provider, decode: nil,
+                                 shouldInterpolate: true, intent: .defaultIntent) {
+                let px = img.width * img.height
+                if px > bestPx { bestImage = img; bestPx = px }
+            }
+        }
+        return bestImage
     }
     
     // MARK: - Binary helpers
     
-    private static func readU16(_ data: Data, offset: Int, littleEndian: Bool) -> UInt16 {
-        guard offset + 1 < data.count else { return 0 }
-        if littleEndian {
-            return UInt16(data[data.startIndex + offset]) | (UInt16(data[data.startIndex + offset + 1]) << 8)
-        } else {
-            return (UInt16(data[data.startIndex + offset]) << 8) | UInt16(data[data.startIndex + offset + 1])
-        }
+    private static func r16(_ d: [UInt8], _ o: Int, _ le: Bool) -> UInt16 {
+        le ? UInt16(d[o]) | (UInt16(d[o+1]) << 8) : (UInt16(d[o]) << 8) | UInt16(d[o+1])
     }
-    
-    private static func readU32(_ data: Data, offset: Int, littleEndian: Bool) -> UInt32 {
-        guard offset + 3 < data.count else { return 0 }
-        if littleEndian {
-            return UInt32(data[data.startIndex + offset])
-                 | (UInt32(data[data.startIndex + offset + 1]) << 8)
-                 | (UInt32(data[data.startIndex + offset + 2]) << 16)
-                 | (UInt32(data[data.startIndex + offset + 3]) << 24)
-        } else {
-            return (UInt32(data[data.startIndex + offset]) << 24)
-                 | (UInt32(data[data.startIndex + offset + 1]) << 16)
-                 | (UInt32(data[data.startIndex + offset + 2]) << 8)
-                 | UInt32(data[data.startIndex + offset + 3])
-        }
+    private static func r32(_ d: [UInt8], _ o: Int, _ le: Bool) -> UInt32 {
+        le ? UInt32(d[o]) | (UInt32(d[o+1])<<8) | (UInt32(d[o+2])<<16) | (UInt32(d[o+3])<<24)
+           : (UInt32(d[o])<<24) | (UInt32(d[o+1])<<16) | (UInt32(d[o+2])<<8) | UInt32(d[o+3])
     }
 }
