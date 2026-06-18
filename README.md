@@ -22,6 +22,19 @@ Finderでバーチャルスライドファイルを選択してスペースキ�
 | Ventana BIF | `.bif` | Roche / Ventana |
 | 3DHISTECH MRXS | `.mrxs` | 3DHISTECH |
 
+## Update History
+
+### v1.1.1 (2026-06-18)
+
+- **Thumbnail Display Fix**: Retinaディスプレイなどの高解像度環境において、Finderでのサムネイル表示が左上に小さく（1/4サイズに）偏って表示されてしまう問題を修正。
+
+### v1.1
+
+- **Large NDPI Support**: 4GBを超える巨大な Hamamatsu NDPI ファイルについて、独自TIFFパーサーによるフォールバック表示を実装（ズーム/パン対応）。
+- **Performance Logging**: TTFV（表示完了までの時間）や描画遅延の計測（OSSignposter/PerfLogger）を追加。
+- **Trackpad Support**: トラックパッドのピンチズームジェスチャーをサポート。
+- **Color Fix**: 色レンダリングがおかしくなる問題を修正。
+
 ## Requirements
 
 - macOS 13+ (Ventura or later)

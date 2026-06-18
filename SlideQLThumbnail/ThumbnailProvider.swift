@@ -48,6 +48,14 @@ class ThumbnailProvider: QLThumbnailProvider {
             )
             
             let reply = QLThumbnailReply(contextSize: contextSize) { context -> Bool in
+                // Retina display scale compensation
+                let scale = request.scale
+                let currentScaleX = abs(context.ctm.a)
+                if currentScaleX < scale {
+                    let neededScale = scale / currentScaleX
+                    context.scaleBy(x: neededScale, y: neededScale)
+                }
+                
                 let rect = CGRect(origin: .zero, size: contextSize)
                 context.draw(cgImage, in: rect)
                 return true
