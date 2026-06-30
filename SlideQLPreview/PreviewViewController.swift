@@ -518,9 +518,36 @@ class PreviewViewController: NSViewController, QLPreviewingController {
             compositeImage.unlockFocus()
             
             DispatchQueue.main.async {
+                // Fallback direct copy (might fail inside Sandbox, but keep as fallback)
                 let pb = NSPasteboard.general
                 pb.clearContents()
-                pb.writeObjects([compositeImage])
+                let directSuccess = pb.writeObjects([compositeImage])
+                
+                // Host application bridge copy
+                if let tiffData = compositeImage.tiffRepresentation,
+                   let bitmap = NSBitmapImageRep(data: tiffData),
+                   let pngData = bitmap.representation(using: .png, properties: [:]) {
+                    
+                    let tempDir = NSTemporaryDirectory()
+                    let fileName = "slide_capture_\(UUID().uuidString).png"
+                    let fileURL = URL(fileURLWithPath: tempDir).appendingPathComponent(fileName)
+                    
+                    do {
+                        try pngData.write(to: fileURL)
+                        
+                        // Send notification to the host app
+                        DistributedNotificationCenter.default().postNotificationName(
+                            NSNotification.Name("com.forensic.slidesvc.copyClipboard"),
+                            object: nil,
+                            userInfo: ["path": fileURL.path],
+                            deliverImmediately: true
+                        )
+                        NSLog("SlideQLPreview: Posted copy notification with path: \(fileURL.path), directSuccess: \(directSuccess)")
+                    } catch {
+                        NSLog("SlideQLPreview: Failed to write temp file for clipboard: \(error.localizedDescription)")
+                    }
+                }
+                
                 self.showCopyFeedback()
             }
         }

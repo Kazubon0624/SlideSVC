@@ -1,7 +1,50 @@
 import SwiftUI
+import Cocoa
+
+class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        setupNotificationListener()
+    }
+    
+    private func setupNotificationListener() {
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleCopyNotification(_:)),
+            name: NSNotification.Name("com.forensic.slidesvc.copyClipboard"),
+            object: nil
+        )
+    }
+    
+    @objc private func handleCopyNotification(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let path = userInfo["path"] as? String else {
+            return
+        }
+        
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        
+        do {
+            let data = try Data(contentsOf: url)
+            if let image = NSImage(data: data) {
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                pb.writeObjects([image])
+                NSLog("SlideSVC Host App: Successfully copied image from QL to clipboard. Path: \(path)")
+            }
+            
+            // Clean up temporary file
+            try FileManager.default.removeItem(at: url)
+        } catch {
+            NSLog("SlideSVC Host App: Failed to copy image or remove temp file: \(error.localizedDescription)")
+        }
+    }
+}
 
 @main
 struct SlideSVCApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    
     var body: some Scene {
         WindowGroup {
             ContentView()

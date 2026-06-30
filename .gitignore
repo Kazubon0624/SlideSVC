@@ -17,3 +17,5 @@ Package.resolved
 # Misc
 *.ips
 .gemini/
+build_output/
+
